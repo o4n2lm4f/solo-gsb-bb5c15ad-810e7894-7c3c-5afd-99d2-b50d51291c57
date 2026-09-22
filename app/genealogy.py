@@ -23,40 +23,54 @@ one batch are aggregated per process (and in the opening stock) before
 any graph check runs.  Rounding to six places happens only when the
 response is rendered.
 
-The producer/consumer dependency graph is validated before any
-inventory moves, and every violation rejects the whole request with
-:class:`GenealogyGraphError` naming the offending ``process_index``:
+The producer/consumer dependency graph is structurally validated
+before any inventory moves, and every violation rejects the whole
+request with :class:`GenealogyGraphError` naming the offending
+``process_index``:
 
 * ``MULTIPLE_PRODUCERS`` -- a batch may be produced by at most one
   process; the detail also carries ``first_index`` (the first producer).
 * ``UNKNOWN_BATCH`` -- a consumed batch must come from the opening
   stock or from exactly one process's outputs.
-* ``CYCLE_DETECTED`` -- the dependencies must be acyclic (a process
-  consuming its own output is a cycle of length one); the detail also
-  carries ``cycle``, the process indices forming the loop.
 
-Execution then runs the processes in a stable topological order
-(Kahn's algorithm; among the ready processes the lowest request index
-always goes first).  Each process deducts its aggregated inputs from
-the running balances and adds its outputs; a process whose input of a
-batch exceeds the available balance fails the whole request with
-:class:`InsufficientStockError` naming the ``process_index``.  A batch
-present in the opening stock may also be produced by a process -- the
-quantities add up.
+Processes are then scheduled round by round against the running
+balances, and every balance comparison uses the unrounded
+:class:`Decimal` weights (rounding to six places happens only when the
+response is rendered).  Each round executes, among the processes whose
+every aggregated input is fully covered by the current stock, the one
+with the lowest request index.  A process whose input of a batch is not
+yet covered keeps waiting while that batch's producer is still
+unexecuted; dependency edges may therefore form loops as long as the
+opening stock primes them (e.g. opening stock of A drives the closed
+chain A -> B -> A).  A batch present in the opening stock may also be
+produced by a process -- the quantities add up.
 
-The result lists the processes in that stable topological order, each
-with its per-batch ``inputs`` / ``outputs`` (first-seen order within
-the process) and the ``input_weight`` / ``output_weight`` /
-``loss_weight`` totals (loss = input - output, negative when a process
-yields more than it consumes), plus ``batches``: every batch in
-first-seen order (opening stock first, then each process's outputs in
-request order) with its ``opening`` / ``produced`` / ``consumed`` /
-``remaining`` weights.
+When no process can execute, the remaining chain is deadlocked:
+
+* ``INSUFFICIENT_STOCK`` (:class:`InsufficientStockError`) -- a
+  remaining process needs more of a batch than will ever arrive,
+  because the batch has no producer or its producer has already
+  finished; the detail names the lowest-index such process (and its
+  first uncovered batch).
+* ``CYCLE_DETECTED`` (:class:`GenealogyGraphError`) -- otherwise the
+  remaining processes still wait for one another's unexecuted outputs;
+  the detail also carries ``cycle``, the process indices forming the
+  loop (a process consuming its own output without covering opening
+  stock is a cycle of length one).
+
+Each executed process deducts its aggregated inputs from the running
+balances and adds its outputs.  The result lists the processes in
+execution order, each with its per-batch ``inputs`` / ``outputs``
+(first-seen order within the process) and the
+``input_weight`` / ``output_weight`` / ``loss_weight`` totals (loss =
+input - output, negative when a process yields more than it consumes),
+plus ``batches``: every batch in first-seen order (opening stock first,
+then each process's outputs in request order) with its ``opening`` /
+``produced`` / ``consumed`` / ``remaining`` weights.
 """
 
 from __future__ import annotations
 
-import heapq
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 
 from .gs1 import GS1ParseError, Element, decode_weight, parse
@@ -89,11 +103,12 @@ class BatchGenealogyError(Exception):
 
 
 class GenealogyGraphError(Exception):
-    """The producer/consumer dependency graph is invalid.
+    """The producer/consumer dependency graph is structurally invalid or
+    the schedule deadlocks in a mutual waiting loop.
 
     ``detail`` is the complete 422 payload: ``process_index`` (plus
-    ``first_index`` for a second producer, ``cycle`` for a dependency
-    cycle) plus the graph error under ``error``.
+    ``first_index`` for a second producer, ``cycle`` for a scheduling
+    deadlock) plus the graph error under ``error``.
     """
 
     def __init__(self, detail: dict):
@@ -102,7 +117,11 @@ class GenealogyGraphError(Exception):
 
 
 class InsufficientStockError(Exception):
-    """A process consumes more of a batch than the balance holds.
+    """A process needs more of a batch than will ever be available.
+
+    Raised when no process is executable and the batch's producer has
+    already finished (or the batch has no producer at all); a shortfall
+    whose producer is still pending only makes the process wait.
 
     ``detail`` is the complete 422 payload: ``process_index`` plus the
     shortfall under ``error``.
@@ -225,12 +244,12 @@ def _weight_text(value: Decimal, unit: str) -> str:
 
 
 def _find_cycle(deps: list[set[int]], remaining: set[int]) -> list[int]:
-    """One dependency cycle among the unscheduled processes.
+    """One waiting cycle among the deadlocked processes.
 
     Deterministic: the walk starts at the lowest remaining index and
-    always follows the lowest-index remaining dependency (every
-    remaining process has at least one), so the first repeated node
-    opens the returned cycle.
+    always follows the lowest-index remaining dependency that is still
+    unexecuted (every remaining process has at least one), so the first
+    repeated node opens the returned cycle.
     """
     path: list[int] = []
     position: dict[int, int] = {}
@@ -242,52 +261,62 @@ def _find_cycle(deps: list[set[int]], remaining: set[int]) -> list[int]:
     return path[position[node] :]
 
 
-def _topo_order(deps: list[set[int]]) -> list[int]:
-    """Stable topological order of the processes.
+def _cycle_error(
+    deps: list[set[int]], remaining: set[int]
+) -> GenealogyGraphError:
+    """Build ``CYCLE_DETECTED`` for the processes still waiting in a loop."""
+    cycle = _find_cycle(deps, remaining)
+    chain = " -> ".join(str(p) for p in (*cycle, cycle[0]))
+    return GenealogyGraphError(
+        {
+            "process_index": cycle[0],
+            "cycle": cycle,
+            "error": {
+                "error": "CYCLE_DETECTED",
+                "message": (
+                    f"processes {chain} are deadlocked waiting for one "
+                    "another's unproduced outputs; a production/consumption "
+                    "loop must be primed with enough opening stock"
+                ),
+                "expected": (
+                    "enough opening stock to run the loop, or an acyclic "
+                    "producer/consumer dependency graph"
+                ),
+                "found": f"waiting cycle {chain}",
+            },
+        }
+    )
 
-    Kahn's algorithm with the ready processes held in a min-heap, so
-    among the processes whose inputs are all available the lowest
-    request index always runs first.  Raises
-    :class:`GenealogyGraphError` when the dependency graph is cyclic.
-    """
-    dependents: list[list[int]] = [[] for _ in deps]
-    indegree = [0] * len(deps)
-    for process_index, required in enumerate(deps):
-        indegree[process_index] = len(required)
-        for producer_index in required:
-            dependents[producer_index].append(process_index)
 
-    ready = [i for i, degree in enumerate(indegree) if degree == 0]
-    heapq.heapify(ready)
-    order = []
-    while ready:
-        process_index = heapq.heappop(ready)
-        order.append(process_index)
-        for dependent in dependents[process_index]:
-            indegree[dependent] -= 1
-            if indegree[dependent] == 0:
-                heapq.heappush(ready, dependent)
-
-    if len(order) < len(deps):
-        remaining = set(range(len(deps))) - set(order)
-        cycle = _find_cycle(deps, remaining)
-        chain = " -> ".join(str(p) for p in (*cycle, cycle[0]))
-        raise GenealogyGraphError(
-            {
-                "process_index": cycle[0],
-                "cycle": cycle,
-                "error": {
-                    "error": "CYCLE_DETECTED",
-                    "message": (
-                        f"processes {chain} form a production/consumption "
-                        "dependency cycle; the graph must be acyclic"
-                    ),
-                    "expected": "an acyclic producer/consumer dependency graph",
-                    "found": f"cycle {chain}",
-                },
-            }
-        )
-    return order
+def _insufficient_stock_error(
+    process_index: int,
+    key: tuple[str, str],
+    amount: Decimal,
+    available: Decimal,
+    target_unit: str,
+) -> InsufficientStockError:
+    """Build ``INSUFFICIENT_STOCK`` naming one short process input."""
+    return InsufficientStockError(
+        {
+            "process_index": process_index,
+            "error": {
+                "error": "INSUFFICIENT_STOCK",
+                "message": (
+                    f"process {process_index}: batch "
+                    f"{_batch_label(key)} requires "
+                    f"{_weight_text(amount, target_unit)} but only "
+                    f"{_weight_text(available, target_unit)} "
+                    "is available"
+                ),
+                "expected": (
+                    f"at most "
+                    f"{_weight_text(available, target_unit)} "
+                    f"of batch {_batch_label(key)}"
+                ),
+                "found": _weight_text(amount, target_unit),
+            },
+        }
+    )
 
 
 def genealogy(
@@ -299,14 +328,16 @@ def genealogy(
 
     ``processes`` is a list of ``(inputs, outputs)`` pairs of scan lists
     in request order.  Returns ``{"target_unit": ..., "processes": [...],
-    "batches": [...]}`` where ``processes`` is in stable topological
-    order (each entry holding ``process_index``, the per-batch
-    ``inputs`` / ``outputs`` dicts of ``{"gtin", "batch", "weight"}``
-    and the ``input_weight`` / ``output_weight`` / ``loss_weight``
-    totals) and ``batches`` holds every batch in first-seen order with
-    its ``opening`` / ``produced`` / ``consumed`` / ``remaining``
-    weights; every weight is an unrounded :class:`Decimal` in the
-    target unit.
+    "batches": [...]}`` where ``processes`` is in execution order --
+    each round runs the lowest-index process whose aggregated inputs are
+    all covered by the current unrounded balances; a process short of a
+    batch whose producer is still pending simply waits (each entry
+    holding ``process_index``, the per-batch ``inputs`` / ``outputs``
+    dicts of ``{"gtin", "batch", "weight"}`` and the
+    ``input_weight`` / ``output_weight`` / ``loss_weight`` totals) --
+    and ``batches`` holds every batch in first-seen order with its
+    ``opening`` / ``produced`` / ``consumed`` / ``remaining`` weights;
+    every weight is an unrounded :class:`Decimal` in the target unit.
     """
     with localcontext() as ctx:
         ctx.prec = ARITHMETIC_PRECISION
@@ -402,36 +433,65 @@ def genealogy(
                         }
                     )
 
-        # Stable topological execution: deduct inputs, then add outputs.
+        # Stock-aware scheduling: each round executes, among the
+        # processes whose every input the current unrounded balances
+        # cover, the lowest request index.  A short input whose producer
+        # is still unexecuted makes the process wait instead of fail, so
+        # opening stock can prime a loop (A -> B -> A).  When no process
+        # is executable a short process whose batch will never be
+        # replenished is INSUFFICIENT_STOCK; otherwise the leftovers
+        # still wait for one another, which is a genuine CYCLE_DETECTED.
         stock = dict(opening)
         results = []
-        for process_index in _topo_order(deps):
+        executed: set[int] = set()
+        while len(executed) < len(processes):
+            chosen: int | None = None
+            shortfalls: list[tuple[int, tuple[str, str], Decimal, Decimal]] = []
+            for process_index in range(len(processes)):
+                if process_index in executed:
+                    continue
+                consumed = consumed_per_process[process_index]
+                first_shortfall: tuple[
+                    tuple[str, str], Decimal, Decimal
+                ] | None = None
+                pending_producer = False
+                for key, amount in consumed.items():
+                    available = stock.get(key, Decimal(0))
+                    if amount <= available:
+                        continue
+                    producer_index = producer.get(key)
+                    if producer_index is not None and producer_index not in executed:
+                        # The batch can still arrive: keep waiting.
+                        pending_producer = True
+                    elif first_shortfall is None:
+                        # No future output can cover this input.
+                        first_shortfall = (key, amount, available)
+                if first_shortfall is None and not pending_producer:
+                    # Every aggregated input is fully covered.
+                    chosen = process_index
+                    break
+                if first_shortfall is not None:
+                    key, amount, available = first_shortfall
+                    shortfalls.append(
+                        (process_index, key, amount, available)
+                    )
+
+            if chosen is None:
+                if shortfalls:
+                    # Iteration is request-index order, so the first
+                    # entry is the lowest-index short process and its
+                    # first uncovered batch (process first-seen order).
+                    process_index, key, amount, available = shortfalls[0]
+                    raise _insufficient_stock_error(
+                        process_index, key, amount, available, target_unit
+                    )
+                remaining = set(range(len(processes))) - executed
+                raise _cycle_error(deps, remaining)
+
+            process_index = chosen
+            executed.add(process_index)
             consumed = consumed_per_process[process_index]
             produced = produced_per_process[process_index]
-            for key, amount in consumed.items():
-                available = stock.get(key, Decimal(0))
-                if amount > available:
-                    raise InsufficientStockError(
-                        {
-                            "process_index": process_index,
-                            "error": {
-                                "error": "INSUFFICIENT_STOCK",
-                                "message": (
-                                    f"process {process_index}: batch "
-                                    f"{_batch_label(key)} requires "
-                                    f"{_weight_text(amount, target_unit)} but "
-                                    f"only {_weight_text(available, target_unit)} "
-                                    "is available"
-                                ),
-                                "expected": (
-                                    f"at most "
-                                    f"{_weight_text(available, target_unit)} "
-                                    f"of batch {_batch_label(key)}"
-                                ),
-                                "found": _weight_text(amount, target_unit),
-                            },
-                        }
-                    )
             for key, amount in consumed.items():
                 stock[key] -= amount
             for key, amount in produced.items():

@@ -694,7 +694,7 @@ curl -X POST http://localhost:8080/trace-audit \
 ## 生产批次谱系审计 `POST /batch-genealogy`
 
 一次提交**期初批次库存**和一组**顺序任意**的转换工序，按 **GTIN + 批号（AI 01 + AI 10）**
-标识批次：先校验生产/消耗依赖图，再按**稳定拓扑序**逐步扣减库存，返回工序谱系、各工序
+标识批次：先做结构性图校验，再按**当前库存逐轮调度**逐步扣减库存，返回工序谱系、各工序
 投入/产出/损耗重量与全部批次的最终余量。
 
 - 请求体：`{"opening_stock": [...], "processes": [{"inputs": [...], "outputs": [...]}], "target_unit": "kg"}`。
@@ -711,20 +711,24 @@ curl -X POST http://localhost:8080/trace-audit \
 - 重量一律使用 `Decimal` 从**原始六位数字与精度位 n** 重建，按固定系数
   **1 lb = 0.45359237 kg** 换算到 `target_unit` 后按 **GTIN+批号** 聚合：期初库存
   聚合一次，每道工序的投入、产出分别聚合。
-- 依赖图校验（在扣减任何库存之前；出错均整单返回 `422` 并携带工序下标）：
+- 结构性图校验（在扣减任何库存之前；出错均整单返回 `422` 并携带工序下标）：
   - **一批多产**：同一批次最多由一道工序产出。第二道产出该批次的工序使整单失败，
     `detail.process_index` 为当前工序、`detail.first_index` 为首次产出的工序
     （错误码 `MULTIPLE_PRODUCERS`）。
   - **无来源批次**：工序消耗的批次必须来自期初库存或某道工序的产出，否则整单失败，
     `detail.process_index` 定位出错工序（错误码 `UNKNOWN_BATCH`）。
-  - **循环依赖**：工序消耗另一工序产出的批次即构成依赖边，依赖图必须无环（工序
-    消耗自身产出也算长度为 1 的环）。检测到环时整单失败，`detail.process_index`
-    与 `detail.cycle` 给出环上的工序下标（错误码 `CYCLE_DETECTED`）。
-- 库存扣减：按**稳定拓扑序**执行工序——在所有投入均已就绪的工序中，**请求下标最小
-  者先执行**；每道工序先按批次扣减投入、再记入产出。任一道工序对某批次的投入超过
-  当前可用余量（超耗）时整单返回 `422`，`detail.process_index` 定位出错工序（错误码
-  `INSUFFICIENT_STOCK`）。同一批次既在期初库存又由工序产出时，数量累加。
-- 响应：`target_unit`、`processes` 与 `batches`。`processes` 按**稳定拓扑序**排列，
+- 库存调度：所有余量判断一律使用**未舍入的 `Decimal` 重量**（六位舍入只在响应渲染时
+  发生）。每一轮在**当前库存足以覆盖全部聚合投入**的工序中，执行**请求下标最小**者；
+  每道工序先按批次扣减投入、再记入产出。投入暂时不足、但对应批次的生产者**尚未执行**
+  时，工序继续等待（期初库存因而可以"点火"闭环，例如期初 A 足量即可驱动 A→B→A
+  成功，产出的 A 与期初数量累加）。当无任何工序可执行时区分两种死局：
+  - **循环依赖**（`CYCLE_DETECTED`）：剩余工序仍在互相等待彼此尚未产出的批次，
+    `detail.process_index` 与 `detail.cycle` 给出等待环上的工序下标（无期初库存点火时
+    工序消耗自身产出也算长度为 1 的环）。
+  - **库存不足**（`INSUFFICIENT_STOCK`）：某工序所需批次没有生产者、或其生产者已全部
+    执行完毕而余量仍不足，等待已无意义；`detail.process_index` 定位下标最小的此类工序
+    （并给出该工序首个不足的批次）。同一批次既在期初库存又由工序产出时，数量累加。
+- 响应：`target_unit`、`processes` 与 `batches`。`processes` 按**实际执行顺序**排列，
   每项含 `process_index`（请求中的下标）、按批次聚合的 `inputs` / `outputs`（各含
   `gtin`、`batch`、`weight`，批次按工序内首次出现排序）以及 `input_weight` /
   `output_weight` / `loss_weight`（损耗 = 投入 − 产出，产出大于投入时为负）。
@@ -735,7 +739,8 @@ curl -X POST http://localhost:8080/trace-audit \
 - `opening_stock` 与 `processes` 均为空数组时返回 `200` 与空的 `processes` / `batches`。
 
 请求示例（10 kg 原料批次 `R1`；工序 1 消耗 6 kg `R1` 产出 5.5 kg 成品批次 `P1`，
-工序 0 再消耗 2 kg `P1` 产出 1.9 kg 批次 `P2`——请求中工序顺序颠倒，仍按拓扑序执行）：
+工序 0 再消耗 2 kg `P1` 产出 1.9 kg 批次 `P2`——请求中工序顺序颠倒，工序 0 先等待
+工序 1 产出 `P1`，实际执行顺序仍为 1、0）：
 
 ```bash
 curl -X POST http://localhost:8080/batch-genealogy \
@@ -743,7 +748,7 @@ curl -X POST http://localhost:8080/batch-genealogy \
   -d '{"opening_stock": ["010950110153000310R1\u001d3103010000"], "processes": [{"inputs": ["010000000000001710P1\u001d3103002000"], "outputs": ["010000000000001710P2\u001d3103001900"]}, {"inputs": ["010950110153000310R1\u001d3103006000"], "outputs": ["010000000000001710P1\u001d3103005500"]}]}'
 ```
 
-响应 `200 OK`：`processes` 按稳定拓扑序排列（工序 1 先于工序 0），`batches` 给出
+响应 `200 OK`：`processes` 按实际执行顺序排列（工序 1 先于工序 0），`batches` 给出
 三个批次的最终余量（`R1` 余 4 kg、`P1` 余 3.5 kg、`P2` 余 1.9 kg）：
 
 ```json
@@ -808,7 +813,9 @@ curl -X POST http://localhost:8080/batch-genealogy \
 }
 ```
 
-依赖成环时返回 `422`，`cycle` 给出环上的工序下标：
+无工序可执行且剩余工序仍在互相等待（死锁环）时返回 `422`，`cycle` 给出等待环上的工序
+下标。注意：若期初库存足以先启动环（如期初有足量 `A` 驱动 A→B→A），整单成功而不是
+报环；只有环上每个工序都在等待另一工序尚未产出的批次时才报此错：
 
 ```json
 {
@@ -817,15 +824,16 @@ curl -X POST http://localhost:8080/batch-genealogy \
     "cycle": [0, 1],
     "error": {
       "error": "CYCLE_DETECTED",
-      "message": "processes 0 -> 1 -> 0 form a production/consumption dependency cycle; the graph must be acyclic",
-      "expected": "an acyclic producer/consumer dependency graph",
-      "found": "cycle 0 -> 1 -> 0"
+      "message": "processes 0 -> 1 -> 0 are deadlocked waiting for one another's unproduced outputs; a production/consumption loop must be primed with enough opening stock",
+      "expected": "enough opening stock to run the loop, or an acyclic producer/consumer dependency graph",
+      "found": "waiting cycle 0 -> 1 -> 0"
     }
   }
 }
 ```
 
-某道工序超耗（投入超过当前可用余量）时返回 `422`，需求量与可用量一并给出：
+某道工序的投入超过其最终可得余量（批次无生产者，或生产者已执行完毕而仍不足）时返回
+`422`，需求量与可用量一并给出：
 
 ```json
 {
@@ -1231,7 +1239,7 @@ app/
   pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、as_of+min_remaining_days 效期门槛、按实际效期分配需求；whole 整包模式按单条扫描做最小超量子集选择
   recall.py   # 召回范围盘点：GTIN+序列号实物去重与冲突检测、有序规则（GTIN+批号集合+效期闭区间）首命中归组、未命中汇总
   traceaudit.py # 追溯事件审计：GTIN+序列号实物识别、批号/效期一致性校验、receive→pick→ship 状态机与异常记录、最终状态汇总
-  genealogy.py # 生产批次谱系审计：GTIN+批号批次台账、一批一产/无来源/循环依赖图校验、稳定拓扑序库存扣减与超耗拒绝、批次最终余量
+  genealogy.py # 生产批次谱系审计：GTIN+批号批次台账、一批一产/无来源结构校验、未舍入库存逐轮调度（待产出先等待、期初库存可点火闭环）、死锁环与最终库存不足拒绝、批次最终余量
   packing.py  # 装箱装载审计：容器森林校验（重复容器/未知父容器/环）、GTIN+序列号重复装载检测、叶到根直属与递归重量/货品数汇总、over_limit 超重标记
   sampling.py # 批次重量双重抽样验收：GTIN+批号计划（闭区间 + n1/a1/r1/n2/a2/r2 阈值校验）、样本唯一 01/10/21/重量 AI 校验与 GTIN+序列号去重、阶段容量、匹配计划与定论后终止（STAGE_AFTER_DECISION）校验、一阶段定论终局不可改写的 accept/reject/pending 判定
 tests/

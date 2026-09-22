@@ -323,6 +323,239 @@ def test_weights_render_as_exact_six_place_numbers():
     assert '"opening":"2.513000"' not in resp.text
 
 
+# ------------------------------ stock-primed production loops
+
+
+def test_opening_stock_primes_a_closed_production_loop():
+    # A -> B -> A is a loop edge-wise, but 10 kg of opening A drives the
+    # whole closed chain; it must not be reported as a dependency cycle.
+    resp = genealogy(
+        opening_stock=[scan(batch="A", weight="3103010000")],
+        processes=[
+            process(
+                inputs=[scan(batch="A", weight="3103010000")],
+                outputs=[scan(batch="B", weight="3103009000")],
+            ),
+            process(
+                inputs=[scan(batch="B", weight="3103009000")],
+                outputs=[scan(batch="A", weight="3103008000")],
+            ),
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [p["process_index"] for p in body["processes"]] == [0, 1]
+
+    first, second = body["processes"]
+    assert first["inputs"] == [{"gtin": GTIN_RAW, "batch": "A", "weight": 10.0}]
+    assert first["outputs"] == [{"gtin": GTIN_RAW, "batch": "B", "weight": 9.0}]
+    assert first["input_weight"] == 10.0
+    assert first["output_weight"] == 9.0
+    assert first["loss_weight"] == 1.0
+    assert second["inputs"] == [{"gtin": GTIN_RAW, "batch": "B", "weight": 9.0}]
+    assert second["outputs"] == [{"gtin": GTIN_RAW, "batch": "A", "weight": 8.0}]
+    assert second["input_weight"] == 9.0
+    assert second["output_weight"] == 8.0
+    assert second["loss_weight"] == 1.0
+
+    batches = batches_by_name(body)
+    assert batches["A"] == {
+        "gtin": GTIN_RAW,
+        "batch": "A",
+        "opening": 10.0,
+        "produced": 8.0,
+        "consumed": 10.0,
+        "remaining": 8.0,
+    }
+    assert batches["B"] == {
+        "gtin": GTIN_RAW,
+        "batch": "B",
+        "opening": 0.0,
+        "produced": 9.0,
+        "consumed": 9.0,
+        "remaining": 0.0,
+    }
+    # Six-place fixed-point rendering is preserved through the loop.
+    assert '"opening":10.000000' in resp.text
+    assert '"remaining":8.000000' in resp.text
+    assert '"remaining":0.000000' in resp.text
+    assert '"loss_weight":1.000000' in resp.text
+    assert '"opening":"10.000000"' not in resp.text
+
+
+def test_primed_loop_with_reversed_request_order_runs_lowest_ready_first():
+    # Same closed chain with the processes reversed in the request:
+    # process 0 waits for B, process 1 is ready on opening A and runs
+    # first, after which process 0 becomes executable.
+    resp = genealogy(
+        opening_stock=[scan(batch="A", weight="3103010000")],
+        processes=[
+            process(
+                inputs=[scan(batch="B", weight="3103009000")],
+                outputs=[scan(batch="A", weight="3103008000")],
+            ),
+            process(
+                inputs=[scan(batch="A", weight="3103010000")],
+                outputs=[scan(batch="B", weight="3103009000")],
+            ),
+        ],
+    )
+    assert resp.status_code == 200
+    assert [p["process_index"] for p in resp.json()["processes"]] == [1, 0]
+    assert batches_by_name(resp.json())["A"]["remaining"] == 8.0
+
+
+def test_primed_self_consuming_process_succeeds():
+    # Consuming and producing one batch is a loop of length one; enough
+    # opening stock covers it (and the output tops the batch back up).
+    resp = genealogy(
+        opening_stock=[scan(batch="A", weight="3103001000")],
+        processes=[
+            process(
+                inputs=[scan(batch="A", weight="3103001000")],
+                outputs=[scan(batch="A", weight="3103000900")],
+            )
+        ],
+    )
+    assert resp.status_code == 200
+    batch = batches_by_name(resp.json())["A"]
+    assert batch["opening"] == 1.0
+    assert batch["produced"] == 0.9
+    assert batch["consumed"] == 1.0
+    assert batch["remaining"] == 0.9
+
+
+def test_loop_inputs_are_compared_with_unrounded_decimal_stock():
+    # 25.13 lb converts to the 10-place 11.3987762581 kg on both sides;
+    # the A -> B -> A loop may only start when coverage is judged on the
+    # unrounded Decimal balance rather than its six-place rendering.
+    lb_scan = f"01{GTIN_RAW}10A{GS}3202002513"
+    resp = genealogy(
+        opening_stock=[lb_scan],
+        processes=[
+            process(
+                inputs=[lb_scan],
+                outputs=[scan(batch="B", weight="3103010000")],
+            ),
+            process(
+                inputs=[scan(batch="B", weight="3103010000")],
+                outputs=[scan(batch="A", weight="3103008000")],
+            ),
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [p["process_index"] for p in body["processes"]] == [0, 1]
+    batch_a = batches_by_name(body)["A"]
+    assert batch_a["opening"] == 11.398776
+    assert batch_a["consumed"] == 11.398776
+    assert batch_a["remaining"] == 8.0
+    assert batches_by_name(body)["B"]["remaining"] == 0.0
+
+
+def test_short_input_waits_for_its_unexecuted_producer_then_runs():
+    # Process 1 needs 5 kg of A but only 3 kg exist; process 2 produces
+    # the missing 2 kg.  Process 1 must keep waiting (not fail, not look
+    # like a cycle) and run once process 2 has fed it.
+    resp = genealogy(
+        opening_stock=[scan(batch="A", weight="3103003000")],
+        processes=[
+            process(
+                inputs=[scan(batch="B", weight="3103004000")],
+                outputs=[scan(batch="C", weight="3103001000")],
+            ),
+            process(
+                inputs=[scan(batch="A", weight="3103005000")],
+                outputs=[scan(batch="B", weight="3103004000")],
+            ),
+            process(inputs=[], outputs=[scan(batch="A", weight="3103002000")]),
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [p["process_index"] for p in body["processes"]] == [2, 1, 0]
+    assert batches_by_name(body)["A"]["remaining"] == 0.0
+    assert batches_by_name(body)["C"]["remaining"] == 1.0
+
+
+def test_loop_with_too_little_opening_stock_is_still_a_cycle():
+    resp = genealogy(
+        opening_stock=[scan(batch="A", weight="3103005000")],  # 5 kg ...
+        processes=[
+            process(
+                inputs=[scan(batch="A", weight="3103010000")],  # ... need 10
+                outputs=[scan(batch="B", weight="3103009000")],
+            ),
+            process(
+                inputs=[scan(batch="B", weight="3103009000")],
+                outputs=[scan(batch="A", weight="3103008000")],
+            ),
+        ],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "CYCLE_DETECTED"
+    assert detail["process_index"] == 0
+    assert detail["cycle"] == [0, 1]
+
+
+def test_shortfall_after_the_producer_finished_is_insufficient_stock():
+    # The loop starts: process 0 runs but yields only 1 kg of B while
+    # process 1 needs 9 kg.  B's producer has finished, so the deadlock
+    # is a definitive shortage located at process 1 -- not a cycle.
+    resp = genealogy(
+        opening_stock=[scan(batch="A", weight="3103010000")],
+        processes=[
+            process(
+                inputs=[scan(batch="A", weight="3103010000")],
+                outputs=[scan(batch="B", weight="3103001000")],
+            ),
+            process(
+                inputs=[scan(batch="B", weight="3103009000")],
+                outputs=[scan(batch="A", weight="3103008000")],
+            ),
+        ],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["process_index"] == 1
+    assert detail["error"]["error"] == "INSUFFICIENT_STOCK"
+    assert "9.000000 kg" in detail["error"]["found"]
+    assert "1.000000 kg" in detail["error"]["expected"]
+
+
+def test_permanent_shortfall_outranks_an_independent_waiting_cycle():
+    # Process 0 can never receive 9 kg of R (5 kg opening, no producer)
+    # while processes 1 and 2 deadlock on Y/Z independently; the
+    # concrete shortage is reported instead of the unrelated cycle.
+    resp = genealogy(
+        opening_stock=[scan(batch="R", weight="3103005000")],
+        processes=[
+            process(
+                inputs=[
+                    scan(batch="R", weight="3103009000"),
+                    scan(batch="Y", weight="3103001000"),
+                ],
+                outputs=[],
+            ),
+            process(
+                inputs=[scan(batch="Z", weight="3103001000")],
+                outputs=[scan(batch="Y", weight="3103001000")],
+            ),
+            process(
+                inputs=[scan(batch="Y", weight="3103001000")],
+                outputs=[scan(batch="Z", weight="3103001000")],
+            ),
+        ],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "INSUFFICIENT_STOCK"
+    assert detail["process_index"] == 0
+    assert "9.000000 kg" in detail["error"]["found"]
+    assert "5.000000 kg" in detail["error"]["expected"]
+
+
 # ------------------------------------------------------- graph-level failures
 
 
