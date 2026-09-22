@@ -440,6 +440,228 @@ def test_consumption_is_checked_in_topological_not_request_order():
     assert detail["error"]["error"] == "INSUFFICIENT_STOCK"
 
 
+# ------------------------------------ opening-stock-driven loops (regression)
+
+
+def test_opening_stock_drives_the_chain_through_a_closed_loop():
+    # A -> B -> A is a structural cycle, but 10 kg of opening A is enough
+    # to enter it: process 0 turns A into B and process 1 turns B back
+    # into more A.  This used to be rejected with a false CYCLE_DETECTED.
+    resp = genealogy(
+        opening_stock=[scan(batch="A", weight="3103010000")],  # 10 kg A
+        processes=[
+            process(
+                inputs=[scan(batch="A", weight="3103010000")],
+                outputs=[scan(batch="B", weight="3103008000")],
+            ),
+            process(
+                inputs=[scan(batch="B", weight="3103008000")],
+                outputs=[scan(batch="A", weight="3103009000")],
+            ),
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [p["process_index"] for p in body["processes"]] == [0, 1]
+
+    first, second = body["processes"]
+    assert first["inputs"] == [{"gtin": GTIN_RAW, "batch": "A", "weight": 10.0}]
+    assert first["outputs"] == [{"gtin": GTIN_RAW, "batch": "B", "weight": 8.0}]
+    assert first["loss_weight"] == 2.0
+    assert second["inputs"] == [{"gtin": GTIN_RAW, "batch": "B", "weight": 8.0}]
+    assert second["outputs"] == [{"gtin": GTIN_RAW, "batch": "A", "weight": 9.0}]
+    assert second["loss_weight"] == -1.0
+
+    batches = batches_by_name(body)
+    assert batches["A"] == {
+        "gtin": GTIN_RAW,
+        "batch": "A",
+        "opening": 10.0,
+        "produced": 9.0,
+        "consumed": 10.0,
+        "remaining": 9.0,
+    }
+    assert batches["B"] == {
+        "gtin": GTIN_RAW,
+        "batch": "B",
+        "opening": 0.0,
+        "produced": 8.0,
+        "consumed": 8.0,
+        "remaining": 0.0,
+    }
+    # Six-place output is preserved and rendered as JSON numbers.
+    assert '"remaining":9.000000' in resp.text
+    assert '"loss_weight":-1.000000' in resp.text
+
+
+def test_loop_runs_before_the_ready_process_that_needs_its_output():
+    # Process 2 waits for the A that the B -> A leg of the loop produces;
+    # the loop itself runs first, driven by opening A.
+    resp = genealogy(
+        opening_stock=[scan(batch="A", weight="3103010000")],
+        processes=[
+            process(
+                inputs=[scan(batch="A", weight="3103010000")],
+                outputs=[scan(batch="B", weight="3103008000")],
+            ),
+            process(
+                inputs=[scan(batch="B", weight="3103008000")],
+                outputs=[scan(batch="A", weight="3103009000")],
+            ),
+            process(
+                inputs=[scan(batch="A", weight="3103009000")],
+                outputs=[scan(batch="X", weight="3103009000")],
+            ),
+        ],
+    )
+    assert resp.status_code == 200
+    assert [p["process_index"] for p in resp.json()["processes"]] == [0, 1, 2]
+    assert batches_by_name(resp.json())["X"]["remaining"] == 9.0
+
+
+def test_loop_entered_twice_is_rejected_when_the_stock_runs_out():
+    # The opening 10 kg A carries the chain once; the second A -> B turn
+    # needs 10 kg but only 9 kg A came back, so after the only producer of
+    # B (process 0) has run, the shortage is INSUFFICIENT_STOCK, not a
+    # cycle.
+    resp = genealogy(
+        opening_stock=[scan(batch="A", weight="3103010000")],
+        processes=[
+            process(
+                inputs=[scan(batch="A", weight="3103010000")],
+                outputs=[scan(batch="B", weight="3103008000")],
+            ),
+            process(
+                inputs=[scan(batch="B", weight="3103008000")],
+                outputs=[scan(batch="A", weight="3103009000")],
+            ),
+            process(
+                inputs=[scan(batch="A", weight="3103010000")],
+                outputs=[scan(batch="B2")],
+            ),
+        ],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["process_index"] == 2
+    assert detail["error"]["error"] == "INSUFFICIENT_STOCK"
+    assert "batch 'A'" in detail["error"]["message"]
+
+
+def test_partial_opening_cover_still_deadlocks_as_a_cycle():
+    # 5 kg opening A cannot start the A -> B -> A loop (process 0 needs
+    # 10 kg), and no more A is ever produced: the two processes still
+    # wait on each other, so this is a genuine CYCLE_DETECTED.
+    resp = genealogy(
+        opening_stock=[scan(batch="A", weight="3103005000")],
+        processes=[
+            process(
+                inputs=[scan(batch="A", weight="3103010000")],
+                outputs=[scan(batch="B")],
+            ),
+            process(inputs=[scan(batch="B")], outputs=[scan(batch="A")]),
+        ],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "CYCLE_DETECTED"
+    assert detail["process_index"] == 0
+    assert detail["cycle"] == [0, 1]
+
+
+def test_unrelated_ready_process_runs_before_the_cycle_is_reported():
+    # Process 1 (R -> Z) is unrelated and ready; it runs even though the
+    # 0/2 loop is deadlocked from the first round, and only then does the
+    # remaining chain surface CYCLE_DETECTED.
+    resp = genealogy(
+        opening_stock=[scan(batch="R")],
+        processes=[
+            process(inputs=[scan(batch="B")], outputs=[scan(batch="A")]),
+            process(inputs=[scan(batch="R")], outputs=[scan(batch="Z")]),
+            process(inputs=[scan(batch="A")], outputs=[scan(batch="B")]),
+        ],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"]["error"] == "CYCLE_DETECTED"
+    assert detail["process_index"] == 0
+    assert detail["cycle"] == [0, 2]
+
+
+def test_shortage_after_the_producer_ran_is_not_a_cycle():
+    # The only producer of P1 makes 1 kg; the consumer needs 2 kg.  Once
+    # the producer has run nothing can proceed, but the producer is no
+    # longer pending -- INSUFFICIENT_STOCK names the consumer, not a
+    # (non-existent) cycle.
+    resp = genealogy(
+        processes=[
+            process(inputs=[], outputs=[scan(batch="P1", weight="3103001000")]),
+            process(inputs=[scan(batch="P1", weight="3103002000")], outputs=[]),
+        ],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["process_index"] == 1
+    assert detail["error"]["error"] == "INSUFFICIENT_STOCK"
+    assert "batch 'P1'" in detail["error"]["message"]
+
+
+def test_shortage_of_opening_only_stock_names_the_process():
+    resp = genealogy(
+        opening_stock=[scan(batch="A", weight="3103001000")],
+        processes=[
+            process(
+                inputs=[scan(batch="A", weight="3103002000")],
+                outputs=[scan(batch="B")],
+            ),
+        ],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["process_index"] == 0
+    assert detail["error"]["error"] == "INSUFFICIENT_STOCK"
+
+
+def test_completed_source_shortage_outranks_an_unrelated_cycle():
+    # After process 3 (the only producer of P1) has run with 1 kg,
+    # process 1 can never get its 2 kg; 0/2 form a separate real cycle.
+    # Nothing is executable any more, and the resolvable shortage is
+    # reported as INSUFFICIENT_STOCK rather than the unrelated cycle.
+    resp = genealogy(
+        processes=[
+            process(inputs=[scan(batch="C")], outputs=[scan(batch="D")]),
+            process(inputs=[scan(batch="P1", weight="3103002000")], outputs=[]),
+            process(inputs=[scan(batch="D")], outputs=[scan(batch="C")]),
+            process(inputs=[], outputs=[scan(batch="P1", weight="3103001000")]),
+        ],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["process_index"] == 1
+    assert detail["error"]["error"] == "INSUFFICIENT_STOCK"
+
+
+def test_stock_coverage_uses_the_unrounded_decimal_balance():
+    # 10.000 lb opening vs a 10.001 lb draw: the gap is 0.001 lb =
+    # 0.00000045359237 kg, below the six-place output precision, so both
+    # amounts render as 4.535924 kg.  The unrounded comparison must
+    # still see the shortage rather than rounding "stock == need".
+    resp = genealogy(
+        opening_stock=[f"01{GTIN_RAW}10A{GS}3203010000"],
+        processes=[
+            process(
+                inputs=[f"01{GTIN_RAW}10A{GS}3203010001"],
+                outputs=[],
+            )
+        ],
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["process_index"] == 0
+    assert detail["error"]["error"] == "INSUFFICIENT_STOCK"
+    assert "4.535924 kg" in detail["error"]["message"]
+
+
 # ------------------------------------------------------- scan-level failures
 
 
